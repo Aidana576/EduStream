@@ -1,0 +1,844 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { useLocation, useNavigate } from 'react-router-dom';
+import { useToast } from '../components/Toast';
+import { AIService } from '../lib/api';
+import { useLanguage } from '../context/LanguageContext';
+import { useCourse } from '../context/CourseContext';
+import { PageTransition } from '../components/PageTransition';
+import ShareModal from '../components/ShareModal';
+import { incrementTimeSaved } from '../lib/timeSaved';
+import { loadAISession, saveAISession, clearAISession } from '../lib/aiSessionStorage';
+import { getSavedQuiz, saveQuizToLibrary, setSavedQuizServerQuizId } from '../lib/quizLibrary';
+import { Question, QuizConfig, SmartActionRequest, Material, AISession } from '../types';
+
+interface Message {
+  id: number;
+  type: 'user' | 'ai';
+  text: string;
+  isTyping?: boolean;
+}
+
+type TabType = 'canvas' | 'structure' | 'resources' | 'test-builder';
+const LAST_AI_SESSION_KEY = 'lastAiSessionId';
+
+// --- Components ---
+
+const SmartActionMenu: React.FC<{ 
+    x: number; 
+    y: number; 
+    onAction: (action: SmartActionRequest['action']) => void;
+    onClose: () => void;
+    t: (key: string) => string;
+}> = ({ x, y, onAction, onClose, t }) => (
+    <div 
+        className="fixed z-50 bg-surface border border-border rounded-xl shadow-2xl p-1 animate-fade-in flex flex-col min-w-[160px]"
+        style={{ top: y, left: x }}
+    >
+        <div className="px-3 py-2 border-b border-border/50 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+            {t('ai.actions')}
+        </div>
+        <button onClick={() => onAction('explain')} className="flex items-center gap-2 px-3 py-2 hover:bg-white/5 text-left text-sm text-white rounded-lg transition-colors">
+            <span className="material-symbols-outlined text-sm text-primary">lightbulb</span> {t('ai.action.explain')}
+        </button>
+        <button onClick={() => onAction('simplify')} className="flex items-center gap-2 px-3 py-2 hover:bg-white/5 text-left text-sm text-white rounded-lg transition-colors">
+            <span className="material-symbols-outlined text-sm text-green-400">child_care</span> {t('ai.action.simplify')}
+        </button>
+        <button onClick={() => onAction('translate')} className="flex items-center gap-2 px-3 py-2 hover:bg-white/5 text-left text-sm text-white rounded-lg transition-colors">
+            <span className="material-symbols-outlined text-sm text-purple-400">translate</span> {t('ai.action.translate')}
+        </button>
+    </div>
+);
+
+const AIWorkspace: React.FC = () => {
+  const { addToast } = useToast();
+  const { t } = useLanguage();
+    const { selectedCourse } = useCourse();
+  const location = useLocation();
+    const navigate = useNavigate();
+  
+  // State
+  const [inputValue, setInputValue] = useState('');
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [activeTab, setActiveTab] = useState<TabType>('canvas');
+  const [selection, setSelection] = useState<{text: string, x: number, y: number} | null>(null);
+  
+  // Document State
+  const [documentData, setDocumentData] = useState<Material | null>(null);
+    const [materials, setMaterials] = useState<Material[]>([]);
+  const [isLoadingDoc, setIsLoadingDoc] = useState(true);
+    const [sessions, setSessions] = useState<AISession[]>([]);
+    const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
+
+  // Test Builder State
+  const [testQuestions, setTestQuestions] = useState<Question[]>([]);
+  const [testConfig, setTestConfig] = useState<QuizConfig>({
+      difficulty: 'medium',
+      count: 5,
+      type: 'mcq'
+  });
+  const [showShareModal, setShowShareModal] = useState(false);
+  const [showSaveSuccess, setShowSaveSuccess] = useState(false);
+    const [generatedQuizId, setGeneratedQuizId] = useState<string>('');
+    const [isEditMode, setIsEditMode] = useState(false);
+        const [loadedSavedQuizId, setLoadedSavedQuizId] = useState<string>('');
+
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+
+  const loadServerSessions = async (): Promise<AISession[]> => {
+      try {
+          const data = await AIService.getSessions();
+          setSessions(data);
+          return data;
+      } catch {
+          // non-blocking
+          return [];
+      }
+  };
+
+  const handleSelectMaterial = async (materialId: string) => {
+      try {
+          setIsLoadingDoc(true);
+          const doc = await AIService.getDocument(materialId);
+          setDocumentData(doc);
+          setActiveSessionId(null);
+
+          const stored = loadAISession(doc.id);
+          if (stored) {
+              setMessages(stored.messages.map(m => ({ ...m, isTyping: false })));
+              setTestQuestions(Array.isArray(stored.testQuestions) ? stored.testQuestions : []);
+              if (stored.testConfig) setTestConfig(stored.testConfig);
+          } else {
+              resetSessionState(doc.title);
+          }
+      } catch {
+          addToast('Не удалось открыть материал', 'error');
+      } finally {
+          setIsLoadingDoc(false);
+      }
+  };
+
+  const handleOpenServerSession = async (sessionId: number) => {
+      try {
+          setIsLoadingDoc(true);
+          const session = await AIService.getSessionById(sessionId);
+          setActiveSessionId(session.id);
+          localStorage.setItem(LAST_AI_SESSION_KEY, String(session.id));
+
+          if (session.docId) {
+              try {
+                  const doc = await AIService.getDocument(session.docId);
+                  setDocumentData(doc);
+              } catch {
+                  setDocumentData(null);
+              }
+          }
+
+          const mapped = (session.messages || []).map((m) => ({
+              id: Number(m.id) || Date.now(),
+              type: m.type === 'user' ? 'user' : 'ai',
+              text: m.text || '',
+              isTyping: false,
+          }));
+          setMessages(mapped.length ? mapped : [{ id: 1, type: 'ai', text: 'Сессия пуста.' }]);
+      } catch (error: any) {
+          addToast(error.message || 'Не удалось открыть сессию', 'error');
+      } finally {
+          setIsLoadingDoc(false);
+      }
+  };
+
+  const resetSessionState = (docTitle?: string) => {
+      setActiveTab('canvas');
+      setInputValue('');
+      setIsGenerating(false);
+      setSelection(null);
+      setTestQuestions([]);
+      setGeneratedQuizId('');
+      setLoadedSavedQuizId('');
+      setTestConfig({
+          difficulty: 'medium',
+          count: 5,
+          type: 'mcq'
+      });
+      setMessages([{
+          id: 1,
+          type: 'ai',
+          text: docTitle
+              ? `Я проанализировал документ "**${docTitle}**". Готов ответить на вопросы или создать тест.`
+              : 'Пожалуйста, загрузите материал на странице Дашборда, чтобы начать работу.'
+      }]);
+  };
+
+  // Load Initial Data
+  useEffect(() => {
+     const init = async () => {
+         try {
+             let docId = location.state?.docId;
+
+             try {
+                 const fetchedMaterials = await AIService.getMaterials(selectedCourse?.id);
+                 setMaterials(fetchedMaterials);
+             } catch {
+                 setMaterials([]);
+             }
+             const fetchedSessions = await loadServerSessions();
+
+             const lastSessionId = Number(localStorage.getItem(LAST_AI_SESSION_KEY) || '');
+             const canRestoreLastSession = Number.isFinite(lastSessionId) && fetchedSessions.some(s => s.id === lastSessionId);
+
+             if (!docId) {
+                 if (canRestoreLastSession) {
+                     await handleOpenServerSession(lastSessionId);
+                     return;
+                 }
+                 setIsLoadingDoc(false);
+                 setDocumentData(null);
+                 setMessages([{ 
+                    id: 1, 
+                    type: 'ai', 
+                    text: `Выберите материал вверху, чтобы начать работу.` 
+                 }]);
+                 return;
+             }
+
+             const doc = await AIService.getDocument(docId);
+             setDocumentData(doc);
+
+             const stored = loadAISession(doc.id);
+             if (stored) {
+                 setMessages(stored.messages.map(m => ({ ...m, isTyping: false })));
+                 setTestQuestions(Array.isArray(stored.testQuestions) ? stored.testQuestions : []);
+                 if (stored.testConfig) setTestConfig(stored.testConfig);
+             } else {
+                 const latestForDoc = fetchedSessions.find((session) => session.docId === doc.id);
+                 if (latestForDoc) {
+                     await handleOpenServerSession(latestForDoc.id);
+                 } else {
+                     resetSessionState(doc.title);
+                 }
+             }
+
+             // If navigated from Library with a saved quiz, load it into the builder
+             if (location.state?.savedQuizId) {
+                 const saved = getSavedQuiz(location.state.savedQuizId);
+                 if (saved) {
+                     setActiveTab('test-builder');
+                     setLoadedSavedQuizId(saved.id);
+                     setGeneratedQuizId(saved.serverQuizId || '');
+                     setTestConfig(saved.config);
+                     setTestQuestions(saved.questions);
+                     addToast('Тест загружен из библиотеки', 'success');
+                 } else {
+                     addToast('Не удалось найти тест в библиотеке', 'error');
+                 }
+             }
+
+             // Check for template config after document is loaded
+             if (location.state?.templateConfig) {
+                 setActiveTab('test-builder');
+                 setTestConfig(location.state.templateConfig);
+                 // Pass doc.id explicitly to avoid stale state issues
+                 handleGenerateTest(location.state.templateConfig, doc.id);
+             }
+
+         } catch (e) {
+             addToast("Не удалось загрузить документ", "error");
+             setDocumentData({ id: 'err', title: 'Ошибка', content: 'Не удалось загрузить содержимое.' });
+         } finally {
+             setIsLoadingDoc(false);
+         }
+     };
+
+     init();
+    }, [location.state, selectedCourse?.id]);
+
+  // Persist session locally per document (avoid excessive writes while streaming)
+  useEffect(() => {
+      if (!documentData || documentData.id === 'err') return;
+      if (isGenerating) return;
+
+      const docId = documentData.id;
+      const timeout = window.setTimeout(() => {
+          const storedMessages = messages
+              .filter(m => !m.isTyping)
+              .map(m => ({ id: m.id, type: m.type, text: m.text }));
+          saveAISession(docId, {
+              messages: storedMessages,
+              testQuestions,
+              testConfig,
+          });
+      }, 500);
+
+      return () => window.clearTimeout(timeout);
+  }, [documentData?.id, isGenerating, messages, testQuestions, testConfig]);
+
+  // Scroll to bottom
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isGenerating]);
+
+  // Selection Handler
+  useEffect(() => {
+      const handleSelection = () => {
+          const sel = window.getSelection();
+          if (sel && sel.toString().trim().length > 0 && containerRef.current?.contains(sel.anchorNode)) {
+              const range = sel.getRangeAt(0);
+              const rect = range.getBoundingClientRect();
+              setSelection({
+                  text: sel.toString().trim(),
+                  x: rect.left,
+                  y: rect.bottom + 10 // Position below text
+              });
+          } else {
+              setSelection(null);
+          }
+      };
+
+      document.addEventListener('mouseup', handleSelection);
+      return () => document.removeEventListener('mouseup', handleSelection);
+  }, []);
+
+  // --- Actions ---
+
+  const handleSmartAction = async (action: SmartActionRequest['action']) => {
+      if (!selection) return;
+      const text = selection.text;
+      setSelection(null); // Close menu
+      window.getSelection()?.removeAllRanges();
+
+      // Optimistic UI: Add user message
+      const userMsgId = Date.now();
+      setMessages(prev => [...prev, { id: userMsgId, type: 'user', text: `${action.toUpperCase()}: "${text}"` }]);
+      setIsGenerating(true);
+
+      try {
+          const result = await AIService.performSmartAction({ text, action });
+          // Stream the result - ensure it's a string
+          streamResponse(result || "Действие выполнено");
+      } catch (e) {
+          addToast("Не удалось выполнить действие", "error");
+          streamResponse("Не удалось выполнить действие. Попробуйте ещё раз.");
+          setIsGenerating(false);
+      }
+  };
+
+  const handleSendMessage = async (e?: React.FormEvent) => {
+      e?.preventDefault();
+      if (!inputValue.trim() || isGenerating) return;
+
+      const text = inputValue;
+      setInputValue('');
+      setMessages(prev => [...prev, { id: Date.now(), type: 'user', text }]);
+      setIsGenerating(true);
+
+      // Simulate a logic check for "Test" request
+      if (text.toLowerCase().includes('тест') || text.toLowerCase().includes('quiz')) {
+          setActiveTab('test-builder');
+          handleGenerateTest();
+          streamResponse(t('ai.generating')); // Using translated "Generating..." or "Switching to..."
+          return;
+      }
+
+      try {
+          const result = await AIService.chat(text, documentData?.id, activeSessionId || undefined);
+          if (result.sessionId) {
+              setActiveSessionId(result.sessionId);
+              localStorage.setItem(LAST_AI_SESSION_KEY, String(result.sessionId));
+              loadServerSessions();
+          }
+          streamResponse(result.response || "Сообщение получено");
+      } catch (e) {
+          console.error("Chat error:", e);
+          streamResponse("Не удалось подключиться к серверу. Попробуйте чуть позже.");
+      }
+  };
+
+  const streamResponse = (fullText: string) => {
+      // Safety check: ensure we have a valid string
+      if (!fullText || typeof fullText !== 'string') {
+          fullText = "Ошибка: некорректный ответ сервера";
+      }
+      
+      const aiMsgId = Date.now() + 1;
+      setMessages(prev => [...prev, { id: aiMsgId, type: 'ai', text: '', isTyping: true }]);
+
+      let i = 0;
+      const interval = setInterval(() => {
+          if (i >= fullText.length) {
+              clearInterval(interval);
+              setIsGenerating(false);
+              setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, isTyping: false } : m));
+              return;
+          }
+          
+          const chunk = fullText.slice(0, i + 5); // Chunk size 5 chars
+          setMessages(prev => prev.map(m => m.id === aiMsgId ? { ...m, text: chunk, isTyping: true } : m));
+          i += 5;
+      }, 30);
+  };
+
+  const handleGenerateTest = async (config = testConfig, overrideMaterialId?: string) => {
+      setIsGenerating(true);
+      try {
+          // Use override if provided (during init), otherwise use state
+          // Ensure we don't use 'err' id
+          const currentStateId = documentData && documentData.id !== 'err' ? documentData.id : undefined;
+          const matId = overrideMaterialId || currentStateId;
+          
+          if (!matId) {
+                 throw new Error("Не выбран корректный материал");
+          }
+
+          const quiz = await AIService.generateQuiz({ ...config, materialId: matId });
+          setGeneratedQuizId(quiz.id || '');
+          setTestQuestions(quiz.questions || []);
+          incrementTimeSaved('quizzesGenerated', 1);
+          addToast("Тест успешно сгенерирован", "success");
+      } catch (e: any) {
+          addToast(e.message || "Ошибка при генерации теста", "error");
+      } finally {
+          setIsGenerating(false);
+      }
+  };
+
+  const handleRegenerateQuestion = async (id: string) => {
+      addToast("Перегенерация вопроса...", "info");
+      
+      try {
+          const newQ = await AIService.regenerateBlock(id, "context");
+          setTestQuestions(prev => prev.map(q => q.id === id ? newQ : q));
+          addToast("Вопрос обновлён", "success");
+      } catch (e) {
+          addToast("Не удалось обновить вопрос", "error");
+      }
+  };
+
+  const handleQuestionChange = (index: number, patch: Partial<Question>) => {
+      setTestQuestions(prev => prev.map((q, i) => (i === index ? { ...q, ...patch } : q)));
+  };
+
+  const handleOptionChange = (questionIndex: number, optionIndex: number, value: string) => {
+      setTestQuestions(prev => prev.map((q, i) => {
+          if (i !== questionIndex) return q;
+          const options = [...(q.options || [])];
+          options[optionIndex] = value;
+          return { ...q, options };
+      }));
+  };
+
+  const handleSaveEdits = async () => {
+      if (!generatedQuizId) {
+          addToast('Этот тест пока не сохранён на сервере', 'info');
+          return;
+      }
+      try {
+          const updated = await AIService.updateQuiz(generatedQuizId, testQuestions);
+          setTestQuestions(updated.questions || []);
+          addToast('Изменения теста сохранены', 'success');
+          setIsEditMode(false);
+      } catch (error: any) {
+          addToast(error.message || 'Не удалось сохранить изменения', 'error');
+      }
+  };
+
+  const ensureServerQuizId = async (): Promise<string> => {
+      if (generatedQuizId) return generatedQuizId;
+      if (!documentData || documentData.id === 'err') {
+          addToast('Сначала выберите материал', 'error');
+          return '';
+      }
+      if (testQuestions.length === 0) {
+          addToast('Нет вопросов для сохранения', 'error');
+          return '';
+      }
+
+      try {
+          const created = await AIService.createQuizFromDraft(documentData.id, testQuestions);
+          const newQuizId = created.id || '';
+          if (!newQuizId) {
+              addToast('Не удалось сохранить тест на сервере', 'error');
+              return '';
+          }
+
+          setGeneratedQuizId(newQuizId);
+          if (loadedSavedQuizId) {
+              setSavedQuizServerQuizId(loadedSavedQuizId, newQuizId);
+          }
+          addToast('Тест сохранён на сервере', 'success');
+          return newQuizId;
+      } catch (error: any) {
+          addToast(error.message || 'Не удалось сохранить тест на сервере', 'error');
+          return '';
+      }
+  };
+
+  return (
+    <PageTransition>
+    <div className="flex h-full bg-background overflow-hidden relative flex-col md:flex-row">
+        
+        {/* Smart Menu */}
+        {selection && (
+            <SmartActionMenu 
+                x={selection.x} 
+                y={selection.y} 
+                onAction={handleSmartAction}
+                onClose={() => setSelection(null)}
+                t={t}
+            />
+        )}
+
+        {/* Left: Document Viewer */}
+        <div ref={containerRef} className="hidden md:block w-1/2 border-r border-border bg-[#0a0c10] overflow-y-auto p-12 custom-scrollbar">
+            {isLoadingDoc ? (
+                 <div className="flex h-full items-center justify-center">
+                    <span className="material-symbols-outlined animate-spin text-4xl text-primary">sync</span>
+                 </div>
+            ) : documentData ? (
+                <div className="bg-white rounded shadow-2xl p-12 opacity-90 text-slate-800 min-h-[800px] selection:bg-primary/30 selection:text-primary-900">
+                    <h1 className="text-2xl font-bold mb-6 border-b border-slate-200 pb-4">{documentData.title}</h1>
+                    <p className="whitespace-pre-wrap leading-relaxed">{documentData.content}</p>
+                </div>
+            ) : (
+                <div className="flex h-full items-center justify-center text-slate-500">
+                    Document not found. Upload a file to get started.
+                </div>
+            )}
+        </div>
+
+        {/* Right: AI Interface */}
+        <div className="w-full md:w-1/2 flex flex-col h-full bg-background relative">
+             <div className="px-6 border-b border-border bg-surface/30 backdrop-blur-md flex-none z-10">
+                <div className="flex flex-col gap-2 py-2">
+                    <div className="flex items-center gap-4 overflow-x-auto custom-scrollbar">
+                        <button onClick={() => setActiveTab('canvas')} className={`border-b-2 py-2 text-sm font-bold flex items-center gap-2 whitespace-nowrap transition-colors ${activeTab === 'canvas' ? 'border-primary text-white' : 'border-transparent text-slate-500 hover:text-slate-300'}`}>
+                            <span className="material-symbols-outlined text-lg">auto_awesome</span> {t('ai.tab.canvas')}
+                        </button>
+                        <button onClick={() => setActiveTab('test-builder')} className={`border-b-2 py-2 text-sm font-bold flex items-center gap-2 whitespace-nowrap transition-colors ${activeTab === 'test-builder' ? 'border-primary text-white' : 'border-transparent text-slate-500 hover:text-slate-300'}`}>
+                            <span className="material-symbols-outlined text-lg">quiz</span> {t('ai.tab.builder')}
+                        </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-2">
+                        <select
+                            value={documentData?.id || ''}
+                            onChange={(e) => {
+                                const nextId = e.target.value;
+                                if (nextId) handleSelectMaterial(nextId);
+                            }}
+                            className="bg-surface border border-border text-slate-200 rounded-lg px-3 py-2 text-xs flex-1 min-w-[160px]"
+                            title="Выбор материала"
+                        >
+                            <option value="">Выберите материал</option>
+                            {materials.map((material) => (
+                                <option key={material.id} value={material.id}>{material.title}</option>
+                            ))}
+                        </select>
+
+                        <select
+                            value={activeSessionId ?? ''}
+                            onChange={(e) => {
+                                const nextId = Number(e.target.value);
+                                if (nextId) handleOpenServerSession(nextId);
+                            }}
+                            className="bg-surface border border-border text-slate-200 rounded-lg px-3 py-2 text-xs flex-1 min-w-[160px]"
+                            title="История чатов"
+                        >
+                            <option value="">История чатов</option>
+                            {sessions.map((session) => (
+                                <option key={session.id} value={session.id}>{session.title}</option>
+                            ))}
+                        </select>
+
+                        <button
+                            type="button"
+                            onClick={() => {
+                                if (!documentData || documentData.id === 'err') return;
+                                clearAISession(documentData.id);
+                                localStorage.removeItem(LAST_AI_SESSION_KEY);
+                                setActiveSessionId(null);
+                                resetSessionState(documentData.title);
+                                addToast('Начата новая сессия', 'success');
+                            }}
+                            className="flex items-center justify-center gap-2 px-3 py-2 bg-surface border border-border text-slate-300 rounded-lg text-xs font-bold hover:bg-white/5 hover:text-white transition-colors whitespace-nowrap"
+                            title="Начать новую сессию"
+                        >
+                            <span className="material-symbols-outlined text-sm">restart_alt</span>
+                            Новая сессия
+                        </button>
+                    </div>
+                </div>
+             </div>
+
+             <div className="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 pb-32 md:pb-36 scroll-smooth custom-scrollbar">
+                 {activeTab === 'canvas' && (
+                     <>
+                        {messages.map((msg) => (
+                            <div key={msg.id} className={`flex ${msg.type === 'user' ? 'justify-end' : 'justify-start'} animate-fade-in`}>
+                                <div className={`max-w-[85%] rounded-2xl p-4 ${msg.type === 'user' ? 'bg-primary text-white' : 'bg-surface border border-border'}`}>
+                                    {msg.type === 'ai' && (
+                                        <div className="flex items-center gap-2 mb-2 text-primary text-xs font-bold uppercase tracking-wider">
+                                            <span className="material-symbols-outlined text-sm">smart_toy</span> EduBot
+                                        </div>
+                                    )}
+                                    <div className="text-sm leading-relaxed break-words prose prose-invert prose-sm max-w-none" 
+                                         dangerouslySetInnerHTML={{
+                                            __html: msg.text
+                                                .split('\n\n')
+                                                .map(paragraph => {
+                                                    let formatted = paragraph
+                                                        .replace(/\*\*(.*?)\*\*/g, '<strong class="font-bold text-white">$1</strong>')
+                                                        .replace(/\*(.*?)\*/g, '<em class="italic">$1</em>')
+                                                        .replace(/\n/g, '<br>');
+                                                    return `<p class="mb-3 last:mb-0">${formatted}</p>`;
+                                                })
+                                                .join('')
+                                         }}
+                                    />
+                                    {msg.isTyping && (
+                                        <span className="inline-block w-2 h-4 ml-1 bg-current animate-pulse align-middle">|</span>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
+                        <div ref={messagesEndRef} />
+                     </>
+                 )}
+
+                 {activeTab === 'test-builder' && (
+                     <div className="space-y-6 animate-fade-in">
+                         {/* Config Panel */}
+                         <div className="bg-surface border border-border rounded-2xl p-6 grid grid-cols-3 gap-4">
+                             <div>
+                                 <label className="text-xs font-bold text-slate-400">{t('ai.difficulty')}</label>
+                                 <select 
+                                     value={testConfig.difficulty}
+                                     onChange={(e) => setTestConfig({...testConfig, difficulty: e.target.value as any})}
+                                     className="w-full bg-background border border-border rounded-lg p-2 text-white mt-1 text-sm"
+                                 >
+                                     <option value="easy">{t('ai.diff.easy')}</option>
+                                     <option value="medium">{t('ai.diff.medium')}</option>
+                                     <option value="hard">{t('ai.diff.hard')}</option>
+                                 </select>
+                             </div>
+                             <div>
+                                 <label className="text-xs font-bold text-slate-400">{t('ai.count')}: {testConfig.count}</label>
+                                 <input 
+                                    type="range" min="1" max="20"
+                                    value={testConfig.count}
+                                    onChange={(e) => setTestConfig({...testConfig, count: Number(e.target.value)})}
+                                    className="w-full mt-2"
+                                 />
+                             </div>
+                             <button 
+                                onClick={() => handleGenerateTest()}
+                                disabled={isGenerating}
+                                className="col-span-1 bg-primary text-white rounded-lg font-bold flex items-center justify-center gap-2 hover:bg-primary-hover disabled:opacity-50"
+                             >
+                                 {isGenerating ? t('ai.generating') : t('ai.generate')}
+                             </button>
+                         </div>
+
+                         {testQuestions.length > 0 && (
+                             <div className="flex items-center justify-between gap-3 bg-surface border border-border rounded-xl p-3">
+                                 <div className="text-sm text-slate-300">
+                                     {generatedQuizId ? 'Тест сохранён на сервере' : 'Локальный черновик'}
+                                 </div>
+                                 <div className="flex items-center gap-2">
+                                     <button
+                                         onClick={() => setIsEditMode(v => !v)}
+                                         className="px-3 py-2 rounded-lg bg-background border border-border text-slate-300 hover:text-white"
+                                     >
+                                         {isEditMode ? 'Закрыть редактирование' : 'Редактировать'}
+                                     </button>
+                                     {isEditMode && (
+                                         <button
+                                             onClick={handleSaveEdits}
+                                             className="px-3 py-2 rounded-lg bg-primary text-white font-bold hover:bg-primary-hover"
+                                         >
+                                             Сохранить правки
+                                         </button>
+                                     )}
+                                 </div>
+                             </div>
+                         )}
+
+                         {/* Questions List */}
+                         {testQuestions.map((q, idx) => (
+                             <div key={q.id} className="bg-surface border border-border rounded-xl p-4 relative group">
+                                 <div className="absolute top-4 right-4 opacity-0 group-hover:opacity-100 transition-opacity flex gap-2">
+                                     <button onClick={() => handleRegenerateQuestion(q.id)} className="p-1.5 bg-background border border-border rounded-lg text-primary hover:bg-white/5" title="Regenerate">
+                                         <span className="material-symbols-outlined text-sm">refresh</span>
+                                     </button>
+                                 </div>
+                                 <div className="flex gap-3">
+                                     <span className="text-slate-500 font-bold">{idx + 1}.</span>
+                                     <div className="flex-1">
+                                         {isEditMode ? (
+                                             <>
+                                                 <input
+                                                     value={q.text}
+                                                     onChange={(e) => handleQuestionChange(idx, { text: e.target.value })}
+                                                     className="w-full bg-background border border-border rounded-lg px-3 py-2 text-white mb-2"
+                                                 />
+                                                 {q.type === 'mcq' && (
+                                                     <div className="space-y-2 mb-2">
+                                                         {(q.options || []).map((opt, i) => (
+                                                             <div key={i} className="grid grid-cols-[1fr_auto] gap-2">
+                                                                 <input
+                                                                     value={opt}
+                                                                     onChange={(e) => handleOptionChange(idx, i, e.target.value)}
+                                                                     className="w-full bg-background border border-border rounded-lg px-3 py-2 text-slate-300 text-sm"
+                                                                 />
+                                                                 <button
+                                                                     onClick={() => handleQuestionChange(idx, { correctAnswer: opt })}
+                                                                     className={`px-3 py-2 rounded-lg text-xs font-bold ${q.correctAnswer === opt ? 'bg-green-600 text-white' : 'bg-background border border-border text-slate-300'}`}
+                                                                 >
+                                                                     Верный
+                                                                 </button>
+                                                             </div>
+                                                         ))}
+                                                     </div>
+                                                 )}
+                                                 {q.type !== 'mcq' && (
+                                                     <input
+                                                         value={q.correctAnswer}
+                                                         onChange={(e) => handleQuestionChange(idx, { correctAnswer: e.target.value })}
+                                                         className="w-full bg-background border border-border rounded-lg px-3 py-2 text-slate-300 text-sm mb-2"
+                                                     />
+                                                 )}
+                                                 <textarea
+                                                     value={q.explanation || ''}
+                                                     onChange={(e) => handleQuestionChange(idx, { explanation: e.target.value })}
+                                                     className="w-full bg-background border border-border rounded-lg px-3 py-2 text-slate-300 text-xs min-h-20"
+                                                 />
+                                             </>
+                                         ) : (
+                                             <>
+                                                 <p className="text-white font-medium mb-2">{q.text}</p>
+                                                 <ul className="space-y-1 ml-4 list-disc text-slate-400 text-sm">
+                                                     {q.options?.map((opt, i) => (
+                                                         <li key={i} className={opt === q.correctAnswer ? 'text-green-400' : ''}>{opt}</li>
+                                                     ))}
+                                                 </ul>
+                                                 <div className="mt-3 p-2 bg-background/50 rounded text-xs text-slate-400 italic">
+                                                     <span className="font-bold not-italic text-slate-300">{t('ai.explanation')}:</span> {q.explanation}
+                                                 </div>
+                                             </>
+                                         )}
+                                     </div>
+                                 </div>
+                             </div>
+                         ))}
+                         
+                         {/* Action Buttons after test generation */}
+                         {testQuestions.length > 0 && (
+                             <div className="bg-primary/5 border border-primary/20 rounded-2xl p-6 space-y-4 animate-fade-in">
+                                 <div className="flex items-center gap-2 text-primary text-sm font-bold uppercase tracking-wider">
+                                     <span className="material-symbols-outlined">check_circle</span>
+                                     Тест сгенерирован успешно ({testQuestions.length} {testQuestions.length === 1 ? 'вопрос' : testQuestions.length < 5 ? 'вопроса' : 'вопросов'})
+                                 </div>
+                                 <div className="grid grid-cols-2 gap-3">
+                                     <button 
+                                         onClick={() => {
+                                             if (!documentData || documentData.id === 'err') {
+                                                 addToast('Сначала выберите материал', 'error');
+                                                 return;
+                                             }
+                                             if (testQuestions.length === 0) return;
+
+                                             saveQuizToLibrary({
+                                                 courseId: selectedCourse?.id,
+                                                 materialId: documentData.id,
+                                                 materialTitle: documentData.title,
+                                                 serverQuizId: generatedQuizId || undefined,
+                                                 config: testConfig,
+                                                 questions: testQuestions,
+                                             });
+                                             setShowSaveSuccess(true);
+                                             addToast('Тест сохранён в библиотеку', 'success', {
+                                                 label: 'Открыть библиотеку',
+                                                 onClick: () => navigate('/library'),
+                                             });
+                                             setTimeout(() => setShowSaveSuccess(false), 3000);
+                                         }}
+                                         className="flex items-center justify-center gap-2 px-4 py-3 bg-surface border border-border text-white rounded-xl font-bold hover:bg-white/5 transition-all group"
+                                     >
+                                         <span className="material-symbols-outlined group-hover:scale-110 transition-transform">save</span>
+                                         Сохранить в библиотеку
+                                     </button>
+                                     <button 
+                                         onClick={async () => {
+                                             const quizId = await ensureServerQuizId();
+                                             if (!quizId) return;
+                                             setShowShareModal(true);
+                                         }}
+                                         className="flex items-center justify-center gap-2 px-4 py-3 bg-primary text-white rounded-xl font-bold hover:bg-primary-hover shadow-lg shadow-primary/20 transition-all group"
+                                     >
+                                         <span className="material-symbols-outlined group-hover:scale-110 transition-transform">share</span>
+                                         Поделиться с учениками
+                                     </button>
+                                 </div>
+                                 <div className="grid grid-cols-2 gap-3">
+                                     <button 
+                                         onClick={async () => {
+                                             const quizId = await ensureServerQuizId();
+                                             if (!quizId) return;
+                                             navigate(`/quiz/${quizId}`);
+                                         }}
+                                         className="flex items-center justify-center gap-2 px-4 py-3 bg-surface border border-border text-slate-300 rounded-xl font-medium hover:bg-white/5 hover:text-white transition-all"
+                                     >
+                                         <span className="material-symbols-outlined text-sm">visibility</span>
+                                         Предпросмотр
+                                     </button>
+                                     <button 
+                                         onClick={() => {
+                                             setTestQuestions([]);
+                                             handleGenerateTest();
+                                         }}
+                                         className="flex items-center justify-center gap-2 px-4 py-3 bg-surface border border-border text-slate-300 rounded-xl font-medium hover:bg-white/5 hover:text-white transition-all"
+                                     >
+                                         <span className="material-symbols-outlined text-sm">refresh</span>
+                                         Сгенерировать заново
+                                     </button>
+                                 </div>
+                             </div>
+                         )}
+                     </div>
+                 )}
+             </div>
+
+             {/* Input Area */}
+             {activeTab === 'canvas' && (
+                <div className="absolute bottom-0 left-0 right-0 p-6 bg-gradient-to-t from-background to-transparent">
+                    <form onSubmit={handleSendMessage} className="relative flex items-center bg-surface border border-border rounded-xl shadow-2xl">
+                        <input 
+                            className="w-full bg-transparent border-none text-white focus:ring-0 py-4 px-4 placeholder-slate-500 outline-none" 
+                            placeholder={t('ai.placeholder')}
+                            value={inputValue}
+                            onChange={(e) => setInputValue(e.target.value)}
+                            disabled={isGenerating}
+                        />
+                        <button type="submit" disabled={isGenerating} className="p-2 mr-2 text-primary hover:bg-white/5 rounded-lg">
+                            <span className="material-symbols-outlined">send</span>
+                        </button>
+                    </form>
+                </div>
+             )}
+        </div>
+    </div>
+    
+    {/* Share Modal */}
+    <ShareModal 
+        isOpen={showShareModal}
+        onClose={() => setShowShareModal(false)}
+        resourceId={generatedQuizId}
+        resourceTitle={documentData?.title || "Тест"}
+        resourceType="quiz"
+    />
+    </PageTransition>
+  );
+};
+
+export default AIWorkspace;
